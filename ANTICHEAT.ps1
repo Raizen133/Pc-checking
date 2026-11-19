@@ -60,7 +60,7 @@ $script:Palette = @{
 # The Discord webhook is stored only on the relay, so this script is safe to publish.
 # User names, the PC name and URL tokens are stripped before anything is sent.
 $script:Report = @{
-    RelayUrl          = 'https://discord.com/api/webhooks/1572644304327942238/emGxmv6FLt9Tk24JSYnRsiulw17o17sJW6n44fCMmKTOLGZtR0q1PPxXoCHG5t-yMFJu'    # Direct Discord webhook
+    RelayUrl          = 'https://discord.com/api/webhooks/1572644304327942238/emGxmv6FLt9Tk24JSYnRsiulw17o17sJW6n44fCMmKTOLGZtR0q1PPxXoCHG5t-yMFJu'    # your BSMM relay (Cloudflare Worker)
     AskPlayerName     = $true    # ask for the player's Roblox username at the start (shown on screen and in the report)
     LiveUpdateSeconds = 120      # how often the live-monitor message is refreshed (keep >= 60 for Discord rate limits)
     AttachFullLog     = $true    # attach the full anonymised log as a .txt file
@@ -5805,63 +5805,40 @@ $script:RelayKeys = @{}
 
 # Posts (or edits, with -MessageId) a report message through the relay. Returns the message id, or $null on failure.
 function Send-BsmmWebhook {
-    param(
-        [hashtable]$Payload,
-        [string]$FileName = '',
-        [string]$FileText = '',
-        [string]$MessageId = ''
-    )
-
+    param([hashtable]$Payload, [string]$FileName = '', [string]$FileText = '', [string]$MessageId = '')
+    if (-not (Test-BsmmRelay)) { return $null }
     $url = ([string]$script:Report.RelayUrl).TrimEnd('/')
-    if ($url -notmatch '^https://(discord\.com|discordapp\.com)/api/webhooks/\d+/[^/\s]+$') {
-        Write-Warning 'Configure a valid Discord webhook in $script:Report.RelayUrl.'
-        return $null
-    }
-
-    $Payload['allowed_mentions'] = @{ parse = @() }
-    $enc = New-Object System.Text.UTF8Encoding($false)
+    $Payload['allowed_mentions'] = @{ parse = @() }    # never ping anyone
     $json = ConvertTo-Json -InputObject $Payload -Depth 10 -Compress
+    $enc = New-Object System.Text.UTF8Encoding($false)
 
     if ($MessageId) {
-        $endpoint = "$url/messages/$MessageId"
-        $r = Invoke-BsmmHttp -Method 'PATCH' -Url $endpoint -Body $enc.GetBytes($json) -ContentType 'application/json'
+        $key = [string]$script:RelayKeys[$MessageId]
+        $r = Invoke-BsmmHttp -Method 'PATCH' -Url "$url/report/$MessageId" -Body $enc.GetBytes($json) -ContentType 'application/json' -Headers @{ 'X-Edit-Key' = $key }
         if ($r.Ok) { return $MessageId }
-        Write-Warning "Discord webhook edit failed: $($r.Error)"
         return $null
     }
 
-    $endpoint = "$url`?wait=true"
     if ($FileName -and $FileText) {
         $boundary = 'BSMM' + [guid]::NewGuid().ToString('N')
         $ms = New-Object System.IO.MemoryStream
-        try {
-            $parts = @(
-                "--$boundary`r`nContent-Disposition: form-data; name=`"payload_json`"`r`nContent-Type: application/json`r`n`r`n$json`r`n",
-                "--$boundary`r`nContent-Disposition: form-data; name=`"files[0]`"; filename=`"$([IO.Path]::GetFileName($FileName))`"`r`nContent-Type: text/plain; charset=utf-8`r`n`r`n",
-                $FileText,
-                "`r`n--$boundary--`r`n"
-            )
-            foreach ($part in $parts) {
-                $bytes = $enc.GetBytes($part)
-                $ms.Write($bytes, 0, $bytes.Length)
-            }
-            $r = Invoke-BsmmHttp -Method 'POST' -Url $endpoint -Body $ms.ToArray() -ContentType "multipart/form-data; boundary=$boundary"
-        } finally {
-            $ms.Dispose()
-        }
+        $parts = @(
+            "--$boundary`r`nContent-Disposition: form-data; name=`"payload_json`"`r`nContent-Type: application/json`r`n`r`n$json`r`n",
+            "--$boundary`r`nContent-Disposition: form-data; name=`"files[0]`"; filename=`"$FileName`"`r`nContent-Type: text/plain; charset=utf-8`r`n`r`n",
+            $FileText,
+            "`r`n--$boundary--`r`n"
+        )
+        foreach ($part in $parts) { $b = $enc.GetBytes($part); $ms.Write($b, 0, $b.Length) }
+        $r = Invoke-BsmmHttp -Method 'POST' -Url "$url/report" -Body $ms.ToArray() -ContentType "multipart/form-data; boundary=$boundary"
     } else {
-        $r = Invoke-BsmmHttp -Method 'POST' -Url $endpoint -Body $enc.GetBytes($json) -ContentType 'application/json'
+        $r = Invoke-BsmmHttp -Method 'POST' -Url "$url/report" -Body $enc.GetBytes($json) -ContentType 'application/json'
     }
-
-    if (-not $r.Ok) {
-        Write-Warning "Discord webhook send failed: $($r.Error)"
-        return $null
-    }
+    if (-not $r.Ok) { return $null }
     try {
-        $response = $r.Body | ConvertFrom-Json
-        if ($response.id) { return [string]$response.id }
-    } catch {}
-    return $null
+        $resp = $r.Body | ConvertFrom-Json
+        if ($resp.key) { $script:RelayKeys[[string]$resp.id] = [string]$resp.key }
+        return [string]$resp.id
+    } catch { return 'sent' }
 }
 
 function Get-BsmmSystemFacts {
